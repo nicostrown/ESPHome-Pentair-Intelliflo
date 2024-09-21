@@ -32,6 +32,7 @@ namespace esphome
         // send the first command in the queue
         this->send_array_cmd(this->tx_buffer.front());
         this->tx_buffer.pop();
+        this->last_received_byte_millis = millis();
         this->ready_to_tx = false;
       }
     }
@@ -204,7 +205,6 @@ namespace esphome
     void Intelliflo::update()
     {
       this->requestPumpStatus();
-      delay(100);
       this->pumpToLocalControl();
     }
 
