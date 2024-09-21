@@ -44,7 +44,7 @@ class Intelliflo : public uart::UARTDevice, public PollingComponent {
   std::queue<std::vector<uint8_t>> tx_buffer;
   bool ready_to_tx = true;
 
-  void QueuePacket(byte message[], int messageLength);
+  void QueuePacket(uint8_t message[], int messageLength);
 
   void requestPumpStatus();
   void pumpToLocalControl();

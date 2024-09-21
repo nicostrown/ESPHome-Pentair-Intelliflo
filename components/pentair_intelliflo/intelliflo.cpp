@@ -152,7 +152,6 @@ void Intelliflo::send_array_cmd(std::vector<uint8_t> data) {
 }
 
 void Intelliflo::send_array_cmd(const uint8_t *data, size_t len) {
-  char br_ch = 0x00;
   this->flush();
 
   this->write_array(&data[0], len);
@@ -164,61 +163,60 @@ void Intelliflo::send_array_cmd(const uint8_t *data, size_t len) {
 
 void Intelliflo::update() {
   this->requestPumpStatus();
-  delay(100);
   this->pumpToLocalControl();
 }
 
 // request pump status
 void Intelliflo::requestPumpStatus() {
   ESP_LOGI(TAG, "Requesting pump status");
-  byte statusPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x07, 0x00};
+  uint8_t statusPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x07, 0x00};
   QueuePacket(statusPacket, 6);
 }
 
 // set pump to local control
 void Intelliflo::pumpToLocalControl() {
   ESP_LOGI(TAG, "Pump going to local control");
-  byte localControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0x00};
+  uint8_t localControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0x00};
   QueuePacket(localControlPacket, 7);
 }
 
 // set pump to remote control
 void Intelliflo::pumpToRemoteControl() {
   ESP_LOGI(TAG, "Pump going to remote control");
-  byte remoteControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0xFF};
+  uint8_t remoteControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0xFF};
   QueuePacket(remoteControlPacket, 7);
 }
 
 // turn pump on/off
 void Intelliflo::run() {
   ESP_LOGI(TAG, "Run Pump");
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x0A};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x0A};
   QueuePacket(pumpPowerPacket, 7);
 }
 
 void Intelliflo::stop() {
   ESP_LOGI(TAG, "Stop Pump");
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x04};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x04};
   QueuePacket(pumpPowerPacket, 7);
 }
 
 void Intelliflo::commandLocalProgram(int prog) {
   ESP_LOGI(TAG, "Command local program %d", prog);
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x05, 0x01, 0};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x05, 0x01, 0};
   pumpPowerPacket[6] = prog + 1;
   QueuePacket(pumpPowerPacket, 7);
 }
 
 void Intelliflo::commandExternalProgram(int prog) {
   ESP_LOGI(TAG, "Command external program %d", prog);
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0x21, 0x00, 0x00};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0x21, 0x00, 0x00};
   pumpPowerPacket[9] = prog * 8;
   QueuePacket(pumpPowerPacket, 10);
 }
 
 void Intelliflo::saveValueForProgram(int prog, int value) {
   ESP_LOGI(TAG, "saveValueForProgram %d: %d", prog, value);
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0, 0, 0};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0, 0, 0};
   pumpPowerPacket[7] = 0x26 + prog;
   pumpPowerPacket[8] = floor(value / 256);
   pumpPowerPacket[9] = value % 256;
@@ -227,7 +225,7 @@ void Intelliflo::saveValueForProgram(int prog, int value) {
 
 void Intelliflo::commandRPM(int rpm) {
   ESP_LOGI(TAG, "Command RPM: %d rpm", rpm);
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x0A, 0x04, 0x02, 0xC4, 0, 0};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x0A, 0x04, 0x02, 0xC4, 0, 0};
   pumpPowerPacket[8] = floor(rpm / 256);
   pumpPowerPacket[9] = rpm % 256;
   QueuePacket(pumpPowerPacket, 10);
@@ -236,12 +234,12 @@ void Intelliflo::commandRPM(int rpm) {
 void Intelliflo::commandFlow(int flow)  // In m3/H * 10
 {
   ESP_LOGI(TAG, "Command Flow: %.1f m3/h", ((double) flow) / 10);
-  byte pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x09, 0x04, 0x02, 0xC4, 0x00, 0};
+  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x09, 0x04, 0x02, 0xC4, 0x00, 0};
   pumpPowerPacket[9] = flow;
   QueuePacket(pumpPowerPacket, 10);
 }
 
-void Intelliflo::QueuePacket(byte message[], int messageLength) {
+void Intelliflo::QueuePacket(uint8_t message[], int messageLength) {
   ESP_LOGV(TAG, "queuePacket: Adding checksum and validating packet to be written ");
   ESP_LOGV(TAG, "queuePacket: message length: %d", messageLength);
 
