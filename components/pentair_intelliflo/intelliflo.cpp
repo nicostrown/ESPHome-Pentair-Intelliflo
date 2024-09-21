@@ -304,7 +304,7 @@ namespace esphome
       int packetSize = 0;
       int requestGet = 0;
 
-      packet.insert(packet.end(), message, message + std::size(message));
+      packet.insert(packet.end(), message, message + messageLength);
       packet.push_back(checksum >> 8);
       packet.push_back(checksum & 0xFF);
 
