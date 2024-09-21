@@ -13,27 +13,27 @@ namespace esphome
 
     void Intelliflo::loop()
     {
-      // while (this->available() > 0)
-      // {
-      //   uint8_t c;
-      //   this->read_byte(&c);
-      //   this->last_received_byte_millis = millis();
-      //   this->handle_received_byte(c);
-      // }
+      while (this->available() > 0)
+      {
+        uint8_t c;
+        this->read_byte(&c);
+        this->last_received_byte_millis = millis();
+        this->handle_received_byte(c);
+      }
 
-      // // allow sending only after 100ms since last received message
-      // if (millis() - this->last_received_byte_millis > 100)
-      // {
-      //   this->ready_to_tx = true;
-      // }
+      // allow sending only after 100ms since last received message
+      if (millis() - this->last_received_byte_millis > 100)
+      {
+        this->ready_to_tx = true;
+      }
 
-      // if (this->ready_to_tx && !this->tx_buffer.empty())
-      // {
-      //   // send the first command in the queue
-      //   this->send_array_cmd(this->tx_buffer.front());
-      //   this->tx_buffer.pop();
-      //   this->ready_to_tx = false;
-      // }
+      if (this->ready_to_tx && !this->tx_buffer.empty())
+      {
+        // send the first command in the queue
+        this->send_array_cmd(this->tx_buffer.front());
+        this->tx_buffer.pop();
+        this->ready_to_tx = false;
+      }
     }
 
     void Intelliflo::dump_config()
