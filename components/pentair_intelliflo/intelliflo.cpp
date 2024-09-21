@@ -304,18 +304,11 @@ namespace esphome
       int packetSize = 0;
       int requestGet = 0;
 
+      packet.insert(packet.end(), message, message + std::size(message));
+      packet.push_back(checksum >> 8);
+      packet.push_back(checksum & 0xFF);
+
       packetSize = messageLength + 3 + 2;
-
-      // Add checksum
-      packet[packetSize - 2] = checksum >> 8;
-      packet[packetSize - 1] = checksum & 0xFF;
-
-      // overload message itself
-      int offset = 3;
-      for (int i = 0; i < packetSize - 5; i++)
-      {
-        packet[offset++] = message[i];
-      }
 
       //-------Internally validate checksum
       int len = 0, packetchecksum = 0, databytes = 0;
