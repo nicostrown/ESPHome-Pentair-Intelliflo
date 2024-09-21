@@ -203,7 +203,7 @@ namespace esphome
 
     void Intelliflo::update()
     {
-      this->requestPumpStatus();
+      // this->requestPumpStatus();
       this->pumpToLocalControl();
     }
 
