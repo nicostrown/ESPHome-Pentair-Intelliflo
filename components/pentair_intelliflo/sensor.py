@@ -44,7 +44,7 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
-    paren = await cg.get_variable(config[CONF_INTELLIFLO_ID])
+    var = await cg.get_variable(config[CONF_INTELLIFLO_ID])
 
     if power_config := config.get(CONF_POWER):
         sens = await sensor.new_sensor(power_config)
