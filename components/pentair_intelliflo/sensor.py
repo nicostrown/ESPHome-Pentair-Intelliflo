@@ -36,6 +36,7 @@ CONFIG_SCHEMA = cv.Schema(
             device_class=DEVICE_CLASS_VOLUME_FLOW_RATE,
         ),
         cv.Optional(CONF_PRESSURE): sensor.sensor_schema(
+            unit_of_measurement="bar",
             accuracy_decimals=3,
             device_class=DEVICE_CLASS_PRESSURE,
         ),
