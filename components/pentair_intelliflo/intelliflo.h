@@ -16,11 +16,6 @@ namespace esphome
 
     class Intelliflo : public uart::UARTDevice, public PollingComponent
     {
-      void set_power(sensor::Sensor *sensor) { power_ = sensor; }
-      void set_rpm(sensor::Sensor *sensor) { rpm_ = sensor; }
-      void set_flow(sensor::Sensor *sensor) { flow_ = sensor; }
-      void set_pressure(sensor::Sensor *sensor) { pressure_ = sensor; }
-
       void switch_command(const std::string &command);
       void setup() override;
       void loop() override;
@@ -63,6 +58,12 @@ namespace esphome
       sensor::Sensor *rpm_;
       sensor::Sensor *flow_;
       sensor::Sensor *pressure_;
+
+    public:
+      void set_power(sensor::Sensor *sensor) { power_ = sensor; }
+      void set_rpm(sensor::Sensor *sensor) { rpm_ = sensor; }
+      void set_flow(sensor::Sensor *sensor) { flow_ = sensor; }
+      void set_pressure(sensor::Sensor *sensor) { pressure_ = sensor; }
     };
 
   } // namespace intelliflo
