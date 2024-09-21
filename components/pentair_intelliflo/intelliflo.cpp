@@ -148,9 +148,12 @@ namespace esphome
         // this->status = packet.data[2];   // 0x01=Priming 0x02=Running 0xFF=?
         if (this->power_ != nullptr)
           this->power_->publish_state((data[8] * 256) + data[9]);
-        // this->rpm = (packet.data[5] * 256) + packet.data[6];
-        // this->flow = packet.data[7] * 0.227;       // GPM to m3/hr
-        // this->pressure = packet.data[8] / 14.504;  // PSI to bar
+        if (this->rpm_ != nullptr)
+          this->rpm_->publish_state((packet.data[10] * 256) + packet.data[11]);
+        if (this->flow_ != nullptr)
+          this->flow_->publish_state(packet.data[12] * 0.227); // GPM to m3/hr
+        if (this->pressure_ != nullptr)
+          this->pressure_->publish_state(packet.data[13] / 14.504); // PSI to bar
         //
         //
         // this->timer_hour = packet.data[11];
