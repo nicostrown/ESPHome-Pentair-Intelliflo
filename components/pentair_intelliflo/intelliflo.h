@@ -1,7 +1,7 @@
 #pragma once
 
 // #include "esphome/components/binary_sensor/binary_sensor.h"
-// #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/sensor/sensor.h"
 // #include "esphome/components/switch/switch.h"
 // #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/uart/uart.h"
@@ -16,11 +16,10 @@ namespace esphome
 
     class Intelliflo : public uart::UARTDevice, public PollingComponent
     {
-      // PIPSOLAR_SENSOR(grid_rating_voltage, QPIRI, float)
-      // PIPSOLAR_VALUED_TEXT_SENSOR(device_mode, QMOD, char)
-      // PIPSOLAR_BINARY_SENSOR(power_saving, QFLAG, int)
-      // PIPSOLAR_TEXT_SENSOR(last_qpigs, QPIGS)
-      // PIPSOLAR_SWITCH(output_source_priority_utility_switch, QPIRI)
+      void set_power(sensor::Sensor *sensor) { power_ = sensor; }
+      void set_rpm(sensor::Sensor *sensor) { rpm_ = sensor; }
+      void set_flow(sensor::Sensor *sensor) { flow_ = sensor; }
+      void set_pressure(sensor::Sensor *sensor) { pressure_ = sensor; }
 
       void switch_command(const std::string &command);
       void setup() override;
@@ -59,6 +58,11 @@ namespace esphome
       void saveValueForProgram(int prog, int value);
       void commandRPM(int rpm);
       void commandFlow(int flow); // In m3/H * 10
+
+      sensor::Sensor *power_;
+      sensor::Sensor *rpm_;
+      sensor::Sensor *flow_;
+      sensor::Sensor *pressure_;
     };
 
   } // namespace intelliflo

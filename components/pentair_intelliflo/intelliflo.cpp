@@ -146,7 +146,8 @@ namespace esphome
         // this->running = packet.data[0];  // 0x04 = stop, 0x0A = run
         // this->mode = packet.data[1];     // 0x00 = stop? 0x04 = PGM4, 0x11 = Priming, 0x0D = QuickClean
         // this->status = packet.data[2];   // 0x01=Priming 0x02=Running 0xFF=?
-        // this->watts = (packet.data[3] * 256) + packet.data[4];
+        if (this->power_ != nullptr)
+          this->power_->publish_state((packet.data[3] * 256) + packet.data[4]);
         // this->rpm = (packet.data[5] * 256) + packet.data[6];
         // this->flow = packet.data[7] * 0.227;       // GPM to m3/hr
         // this->pressure = packet.data[8] / 14.504;  // PSI to bar
@@ -219,7 +220,7 @@ namespace esphome
     // set pump to local control
     void Intelliflo::pumpToLocalControl()
     {
-      ESP_LOGI(TAG, "Pump going to local control");
+      ESP_LOGI(TAG, "Requesting local control");
       uint8_t localControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0x00};
       QueuePacket(localControlPacket, 7);
     }
@@ -227,7 +228,7 @@ namespace esphome
     // set pump to remote control
     void Intelliflo::pumpToRemoteControl()
     {
-      ESP_LOGI(TAG, "Pump going to remote control");
+      ESP_LOGI(TAG, "Requesting remote control");
       uint8_t remoteControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0xFF};
       QueuePacket(remoteControlPacket, 7);
     }
