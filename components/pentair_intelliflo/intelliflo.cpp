@@ -147,7 +147,7 @@ namespace esphome
         // this->mode = packet.data[1];     // 0x00 = stop? 0x04 = PGM4, 0x11 = Priming, 0x0D = QuickClean
         // this->status = packet.data[2];   // 0x01=Priming 0x02=Running 0xFF=?
         if (this->power_ != nullptr)
-          this->power_->publish_state((packet.data[3] * 256) + packet.data[4]);
+          this->power_->publish_state((data[8] * 256) + data[9]);
         // this->rpm = (packet.data[5] * 256) + packet.data[6];
         // this->flow = packet.data[7] * 0.227;       // GPM to m3/hr
         // this->pressure = packet.data[8] / 14.504;  // PSI to bar
