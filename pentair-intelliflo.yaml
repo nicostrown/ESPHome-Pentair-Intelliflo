@@ -1,0 +1,68 @@
+esphome:
+  name: intelliflo
+  friendly_name: Intelliflo
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "your_key"
+
+ota:
+  - platform: esphome
+    password: !secret intelliflo_ota_password
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${device_name} Fallback Hotspot"
+    password: !secret intelliflo_hotspot_password
+
+captive_portal:
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/nicostrown/ESPHome-Pentair-Intelliflo
+    refresh: 0s
+
+uart:
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  
+
+sensor:
+  - platform: pentair_intelliflo
+    power:
+      name: "Power"
+    rpm:
+      name: "RPM"
+    flow:
+      name: "Flow"
+    pressure:
+      name: "Pressure"
+      unit_of_measurement: "bar"
+
+binary_sensor:
+  - platform: pentair_intelliflo
+    running:
+      name: "Running"
+
+text_sensor:
+  - platform: pentair_intelliflo
+    program:
+      name: "Program"
+
+pentair_intelliflo:
