@@ -1,348 +1,351 @@
 #include "intelliflo.h"
-#include "esphome/core/log.h"
+
 #include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+#include <cinttypes>
 
 namespace esphome {
-namespace intelliflo {
+namespace pentair_intelliflo {
 
-static const char *const TAG = "intelliflo";
+static const char *const TAG = "pentair_intelliflo";
 
-void Intelliflo::setup() {}
+// We impersonate the pool controller.
+static const uint8_t CONTROLLER_ADDRESS = 0x10;
 
-void Intelliflo::loop() {
-  while (this->available() > 0) {
-    uint8_t c;
-    this->read_byte(&c);
-    this->last_received_byte_millis = millis();
-    this->handle_received_byte(c);
-  }
+// The pump is slow to turn the line around. Leave a gap between our frames.
+static const uint32_t TX_SPACING_MS = 200;
+// Give up on a half-received frame after this long.
+static const uint32_t RX_IDLE_TIMEOUT_MS = 150;
+// Don't start transmitting if a frame arrived within this window.
+static const uint32_t RX_QUIET_MS = 20;
 
-  // allow sending only after 100ms since last received message
-  if (millis() - this->last_received_byte_millis > 100) {
-    this->ready_to_tx = true;
-  }
+static const uint8_t MAX_PAYLOAD_LEN = 32;
+static const size_t MAX_TX_QUEUE = 12;
+static const uint16_t MAX_RPM = 3450;
 
-  if (this->ready_to_tx && !this->tx_buffer.empty()) {
-    // send the first command in the queue
-    this->send_array_cmd(this->tx_buffer.front());
-    this->tx_buffer.pop();
-    this->last_received_byte_millis = millis();
-    this->ready_to_tx = false;
+static std::string program_to_string(uint8_t value) {
+  switch (value) {
+    case 0x00:
+      return "Filter";
+    case 0x01:
+      return "Manual";
+    case 0x02:
+      return "Backwash";
+    case 0x03:
+      return "Speed 3";
+    case 0x04:
+      return "Speed 4";
+    case 0x06:
+      return "Feature 1";
+    case 0x09:
+      return "External Program 1";
+    case 0x0A:
+      return "External Program 2";
+    case 0x0B:
+      return "External Program 3";
+    case 0x0C:
+      return "External Program 4";
+    case 0x0D:
+      return "Quick Clean";
+    case 0x0E:
+      return "Timeout";
+    case 0x11:
+      return "Priming";
+    default:
+      return str_snprintf("Unknown (0x%02X)", 20, value);
   }
 }
 
-void Intelliflo::dump_config() { ESP_LOGCONFIG(TAG, "  Pentair Intelliflo"); }
-
-void Intelliflo::handle_received_byte(uint8_t c) {
-  this->rx_buffer.push_back(c);
-  if (!this->validate_received_message()) {
-    this->rx_buffer.clear();
+static std::string pump_state_to_string(uint8_t value) {
+  switch (value) {
+    case 0x00:
+      return "Fault";
+    case 0x01:
+      return "Priming";
+    case 0x02:
+      return "Running";
+    case 0x04:
+      return "System Priming";
+    default:
+      return str_snprintf("Unknown (0x%02X)", 20, value);
   }
 }
 
-bool Intelliflo::validate_received_message() {
-  uint32_t at = this->rx_buffer.size() - 1;  // position of the last received byte
-  uint8_t *data = &this->rx_buffer[0];       // pointer to the first byte of the message
+static std::string error_to_string(uint8_t value) {
+  switch (value) {
+    case 0x00:
+      return "OK";
+    case 0x02:
+      return "Filter error";
+    default:
+      return str_snprintf("Error 0x%02X", 16, value);
+  }
+}
 
-  // Byte 0: HEADER (Always 0xFF)
-  if (at == 0) {
-    return data[0] == 0xFF;
-  }
-  // Byte 1: HEADER (Always 0x00)
-  if (at == 1) {
-    return data[1] == 0x00;
-  }
-  // Byte 2: HEADER (Always 0xFF)
-  if (at == 2) {
-    return data[2] == 0xFF;
-  }
-  // Byte 3: HEADER (Always 0xA5)
-  if (at == 3) {
-    return data[3] == 0xA5;
+void PentairIntelliflo::setup() { this->rx_.reserve(64); }
+
+void PentairIntelliflo::dump_config() {
+  ESP_LOGCONFIG(TAG, "Pentair IntelliFlo:");
+  ESP_LOGCONFIG(TAG, "  Pump address: 0x%02X", this->address_);
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "Power", this->power_);
+  LOG_SENSOR("  ", "Speed", this->rpm_);
+  LOG_SENSOR("  ", "Flow", this->flow_);
+  LOG_SENSOR("  ", "Filter percent", this->filter_percent_);
+  LOG_SENSOR("  ", "Error code", this->error_code_);
+  LOG_SENSOR("  ", "Time remaining", this->time_remaining_);
+  LOG_BINARY_SENSOR("  ", "Running", this->running_);
+  LOG_BINARY_SENSOR("  ", "Remote control", this->remote_control_);
+  LOG_TEXT_SENSOR("  ", "Program", this->program_);
+  LOG_TEXT_SENSOR("  ", "Pump state", this->pump_state_);
+  LOG_TEXT_SENSOR("  ", "Error", this->error_);
+}
+
+void PentairIntelliflo::update() { this->request_status(); }
+
+void PentairIntelliflo::loop() {
+  const uint32_t now = millis();
+
+  if (!this->rx_.empty() && now - this->last_rx_ms_ > RX_IDLE_TIMEOUT_MS) {
+    ESP_LOGV(TAG, "Dropping %u stale RX bytes", (unsigned) this->rx_.size());
+    this->rx_.clear();
   }
 
-  // Byte 2: packet_size - number of bytes further + 1
-  // Check is not carried out
-  if (at <= 8) {
+  uint8_t byte;
+  while (this->available() > 0 && this->read_byte(&byte)) {
+    this->last_rx_ms_ = now;
+    this->feed_byte_(byte);
+  }
+
+  if (this->tx_queue_.empty() || now - this->last_tx_ms_ < TX_SPACING_MS)
+    return;
+  // Never talk over an inbound frame.
+  if (now - this->last_rx_ms_ < RX_QUIET_MS)
+    return;
+
+  const std::vector<uint8_t> frame = std::move(this->tx_queue_.front());
+  this->tx_queue_.pop_front();
+  this->write_array(frame.data(), frame.size());
+  this->flush();
+  this->last_tx_ms_ = millis();
+  ESP_LOGD(TAG, "TX: %s", format_hex_pretty(frame).c_str());
+}
+
+// Frames look like: [FF...] 00 FF A5 <proto> <dst> <src> <cmd> <len> <payload> <ckHi> <ckLo>
+// The leading 0xFF run is line idle/wake-up padding and its length varies, so we
+// sync on the "00 FF A5" sequence and only ever discard one byte at a time when
+// something does not line up. Discarding the whole buffer (as the upstream
+// component does) throws away the frame that follows a bad byte.
+void PentairIntelliflo::feed_byte_(uint8_t byte) {
+  this->rx_.push_back(byte);
+
+  while (true) {
+    if (!this->resync_())
+      return;
+    if (this->rx_.size() < 8)
+      return;  // header + length byte not complete yet
+
+    const uint8_t len = this->rx_[7];
+    if (len > MAX_PAYLOAD_LEN) {
+      ESP_LOGW(TAG, "Implausible payload length %u, resyncing", len);
+      this->rx_.erase(this->rx_.begin());
+      continue;
+    }
+
+    const size_t total = (size_t) len + 10;
+    if (this->rx_.size() < total)
+      return;
+
+    // Checksum covers 0xA5 through the last payload byte.
+    uint16_t sum = 0;
+    for (size_t i = 2; i < (size_t) 8 + len; i++)
+      sum += this->rx_[i];
+    const uint16_t expected = ((uint16_t) this->rx_[8 + len] << 8) | this->rx_[9 + len];
+
+    if (sum != expected) {
+      ESP_LOGW(TAG, "Checksum mismatch (calc 0x%04X, frame 0x%04X): %s", sum, expected,
+               format_hex_pretty(this->rx_.data(), total).c_str());
+      this->rx_.erase(this->rx_.begin());
+      continue;
+    }
+
+    this->handle_frame_(total);
+    this->rx_.erase(this->rx_.begin(), this->rx_.begin() + total);
+  }
+}
+
+bool PentairIntelliflo::resync_() {
+  while (!this->rx_.empty()) {
+    const size_t n = this->rx_.size();
+    if (this->rx_[0] != 0x00) {
+      this->rx_.erase(this->rx_.begin());
+      continue;
+    }
+    if (n >= 2 && this->rx_[1] != 0xFF) {
+      this->rx_.erase(this->rx_.begin());
+      continue;
+    }
+    if (n >= 3 && this->rx_[2] != 0xA5) {
+      this->rx_.erase(this->rx_.begin());
+      continue;
+    }
     return true;
   }
-  uint8_t packet_size = data[8];
-  uint8_t length = (packet_size + 10);
-
-  // wait until all data of the package arrives
-  if (at < length) {
-    return true;
-  }
-
-  // calculate the checksum
-  uint16_t checksum = 0;
-  for (int j = 3; j < 3 + packet_size + 6; j++) {
-    checksum = checksum + data[j];
-  }
-
-  uint16_t packet_checksum = (data[3 + 6 + packet_size] << 8) + data[3 + 7 + packet_size];
-  if (checksum != packet_checksum) {
-    ESP_LOGW(TAG, "CHECKSUM MISMATCH - got %d, expected %d", checksum, packet_checksum);
-    return false;
-  }
-
-  // the correct message was received and lies in the rx_buffer buffer
-
-  // Remove 0xFF 00 FF from the beginning of the message
-  rx_buffer.erase(rx_buffer.begin());
-  rx_buffer.erase(rx_buffer.begin());
-  rx_buffer.erase(rx_buffer.begin());
-
-  std::string pretty_cmd = format_hex_pretty(rx_buffer);
-  ESP_LOGI(TAG, "Package received: %S ", pretty_cmd.c_str());
-
-  parse_packet(rx_buffer);
-
-  // return false to reset rx buffer
   return false;
 }
 
-void Intelliflo::parse_packet(const std::vector<uint8_t> &data) {
-  if (data[3] == 0x60 && data[4] == 0x01) {
-    ESP_LOGI(TAG, "Pump goes to ext program %d", data[6]);
-  } else if (data[3] == 0x60 && data[4] == 0x04 && data[6] == 0x00) {
-    ESP_LOGI(TAG, "Pump is local");
-  } else if (data[3] == 0x60 && data[4] == 0x04 && data[6] == 0xFF) {
-    ESP_LOGI(TAG, "Pump is remote");
-  } else if (data[3] == 0x60 && data[4] == 0x05) {
-    ESP_LOGI(TAG, "Pump goes to local program %02x", data[7]);
-  } else if (data[3] == 0x60 && data[4] == 0x07) {
-    // we have a pump status packet
+void PentairIntelliflo::handle_frame_(size_t total) {
+  const uint8_t src = this->rx_[5];
+  const uint8_t cmd = this->rx_[6];
+  const uint8_t len = this->rx_[7];
+  const uint8_t *payload = this->rx_.data() + 8;
 
-    if (this->running_ != nullptr)
-      switch (data[6]) {
-        case STOPPED:
-          this->running_->publish_state(false);
-          break;
-        case RUNNING:
-          this->running_->publish_state(true);
-          break;
-        default:
-          ESP_LOGW(TAG, "Received unknown running value %0x02x", data[6]);
-          break;
+  ESP_LOGV(TAG, "RX: %s", format_hex_pretty(this->rx_.data(), total).c_str());
+
+  // Half-duplex means we usually hear our own frames (src 0x10) as well as
+  // anything else on the bus. Only our pump's replies are interesting.
+  if (src != this->address_)
+    return;
+
+  switch (cmd) {
+    case 0x04:  // remote control acknowledgement
+      if (len >= 1) {
+        const bool remote = payload[0] != 0x00;
+        if (remote != this->remote_state_)
+          ESP_LOGI(TAG, "Pump switched to %s control", remote ? "REMOTE" : "LOCAL");
+        this->remote_state_ = remote;
+        if (this->remote_control_ != nullptr)
+          this->remote_control_->publish_state(remote);
       }
+      break;
 
-    if (this->program_ != nullptr)
-      switch (data[7]) {
-        case NO_PROG:
-          this->program_->publish_state("");
-          break;
-        case LOCAL1:
-          this->program_->publish_state("Local 1");
-          break;
-        case LOCAL2:
-          this->program_->publish_state("Local 2");
-          break;
-        case LOCAL3:
-          this->program_->publish_state("Local 3");
-          break;
-        case LOCAL4:
-          this->program_->publish_state("Local 4");
-          break;
-        case EXT1:
-          this->program_->publish_state("External 1");
-          break;
-        case EXT2:
-          this->program_->publish_state("External 2");
-          break;
-        case EXT3:
-          this->program_->publish_state("External 3");
-          break;
-        case EXT4:
-          this->program_->publish_state("External 4");
-          break;
-        case TIMEOUT:
-          this->program_->publish_state("Time Out");
-          break;
-        case PRIMING:
-          this->program_->publish_state("Priming");
-          break;
-        case QUICKCLEAN:
-          this->program_->publish_state("Quick Clean");
-          break;
-        case UNKNOWN:
-          this->program_->publish_state("Unknown");
-          break;
-        default:
-          ESP_LOGW(TAG, "Received unknown program value %0x02x", data[7]);
-          break;
+    case 0x07:  // status
+      if (len >= 15) {
+        this->publish_status_(payload);
+      } else {
+        ESP_LOGW(TAG, "Status frame too short (%u payload bytes)", len);
       }
+      break;
 
-    // this->status = packet.data[2];   // 0x01=Priming 0x02=Running 0xFF=?
-    if (this->power_ != nullptr)
-      this->power_->publish_state((data[9] * 256) + data[10]);
-    if (this->rpm_ != nullptr)
-      this->rpm_->publish_state((data[11] * 256) + data[12]);
-    if (this->flow_ != nullptr)
-      this->flow_->publish_state(data[13] * 0.227);  // GPM to m3/hr
-    if (this->pressure_ != nullptr)
-      this->pressure_->publish_state(data[14] / 14.504);  // PSI to bar
-    //
-    //
-    // this->timer_hour = packet.data[11];
-    // this->timer_min = packet.data[12];
-    // this->hour = packet.data[13];
-    // this->minutes = packet.data[14];
-
-    // ESP_LOGI(TAG, "R: 0x%02x - M: 0x%02x (%s) - St: 0x%02x", pc->running, pc->mode, pc->getMode()._to_string(),
-    //          pc->status);
-    // ESP_LOGI(TAG, "P: %dW - Sp: %dtr/min - F: %.2fm3/h - P: %.2fbar", pc->watts, pc->rpm, pc->flow, pc->pressure);
-    // ESP_LOGI(TAG, "B9: 0x%02x - B10: 0x%02x - Tmr: %d:%02d - Hr: %d:%02d", packet.data[9], packet.data[10],
-    //          pc->timer_hour, pc->timer_min, pc->hour, pc->minutes);
-  } else if (data[3] == 0x60 && data[4] == 0x09) {
-    // ESP_LOGI(TAG, "Pump goes to flow mode: %0.1f m3/h", ((double) packet.data[1]) / 10);
-  } else if (data[3] == 0x60 && data[4] == 0x0A) {
-    // ESP_LOGI(TAG, "Pump goes to rpm mode: %d rpm", (packet.data[0] * 256) + packet.data[1]);
-    // } else if (data[3] == 0x60 && packet.length == 1 && data[4] == 0xFF) {
-    //   ESP_LOGW(TAG, "CMD error: %02x", packet.data[0]);
-  } else {
-    // if (Debug.isActive(Debug.INFO)) {
-    //   char hd_buffer[(6 + packet.length + 2) * 3];
-    //   char *ptr_hd;
-    //   ptr_hd = hd_buffer;
-    //   for (int j = start; j < start + 6 + packet.length + 2; j++) {
-    //     ptr_hd += sprintf(ptr_hd, " %02x", (unsigned char) data[j]);
-    // }
-    // ESP_LOGI(TAG, "undecoded packet:%s", hd_buffer);
+    default:
+      ESP_LOGD(TAG, "Pump acked command 0x%02X: %s", cmd, format_hex_pretty(payload, len).c_str());
+      break;
   }
 }
 
-void Intelliflo::send_array_cmd(std::vector<uint8_t> data) {
-  return send_array_cmd((const uint8_t *) data.data(), data.size());
+void PentairIntelliflo::publish_status_(const uint8_t *p) {
+  const bool running = p[0] == PUMP_STARTED;
+  const uint16_t watts = ((uint16_t) p[3] << 8) | p[4];
+  const uint16_t rpm = ((uint16_t) p[5] << 8) | p[6];
+
+  this->running_state_ = running;
+  this->watts_state_ = watts;
+  this->rpm_state_ = rpm;
+
+  if (this->running_ != nullptr)
+    this->running_->publish_state(running);
+  if (this->program_ != nullptr)
+    this->program_->publish_state(program_to_string(p[1]));
+  if (this->pump_state_ != nullptr)
+    this->pump_state_->publish_state(pump_state_to_string(p[2]));
+  if (this->power_ != nullptr)
+    this->power_->publish_state(watts);
+  if (this->rpm_ != nullptr)
+    this->rpm_->publish_state(rpm);
+  if (this->flow_ != nullptr)
+    this->flow_->publish_state(p[7]);
+  if (this->filter_percent_ != nullptr)
+    this->filter_percent_->publish_state(p[8]);
+  if (this->error_code_ != nullptr)
+    this->error_code_->publish_state(p[10]);
+  if (this->error_ != nullptr)
+    this->error_->publish_state(error_to_string(p[10]));
+  if (this->time_remaining_ != nullptr)
+    this->time_remaining_->publish_state(p[11] * 60 + p[12]);
+
+  ESP_LOGI(TAG, "Status: %s, %u rpm, %u W, %u gpm, mode 0x%02X, drive 0x%02X, error 0x%02X",
+           running ? "started" : "stopped", rpm, watts, p[7], p[1], p[2], p[10]);
 }
 
-void Intelliflo::send_array_cmd(const uint8_t *data, size_t len) {
-  this->flush();
-
-  this->write_array(&data[0], len);
-
-  // print to log
-  std::string pretty_cmd = format_hex_pretty((uint8_t *) &data[0], len);
-  ESP_LOGI(TAG, "Sent: %S ", pretty_cmd.c_str());
-}
-
-void Intelliflo::update() {
-  this->requestPumpStatus();
-  this->pumpToLocalControl();
-}
-
-// request pump status
-void Intelliflo::requestPumpStatus() {
-  ESP_LOGI(TAG, "Requesting pump status");
-  uint8_t statusPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x07, 0x00};
-  QueuePacket(statusPacket, 6);
-}
-
-// set pump to local control
-void Intelliflo::pumpToLocalControl() {
-  ESP_LOGI(TAG, "Requesting local control");
-  uint8_t localControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0x00};
-  QueuePacket(localControlPacket, 7);
-}
-
-// set pump to remote control
-void Intelliflo::pumpToRemoteControl() {
-  ESP_LOGI(TAG, "Requesting remote control");
-  uint8_t remoteControlPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x04, 0x01, 0xFF};
-  QueuePacket(remoteControlPacket, 7);
-}
-
-// turn pump on/off
-void Intelliflo::run() {
-  ESP_LOGI(TAG, "Run Pump");
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x0A};
-  QueuePacket(pumpPowerPacket, 7);
-}
-
-void Intelliflo::stop() {
-  ESP_LOGI(TAG, "Stop Pump");
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x06, 0x01, 0x04};
-  QueuePacket(pumpPowerPacket, 7);
-}
-
-void Intelliflo::commandLocalProgram(int prog) {
-  ESP_LOGI(TAG, "Command local program %d", prog);
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x05, 0x01, 0};
-  pumpPowerPacket[6] = prog + 1;
-  QueuePacket(pumpPowerPacket, 7);
-}
-
-void Intelliflo::commandExternalProgram(int prog) {
-  ESP_LOGI(TAG, "Command external program %d", prog);
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0x21, 0x00, 0x00};
-  pumpPowerPacket[9] = prog * 8;
-  QueuePacket(pumpPowerPacket, 10);
-}
-
-void Intelliflo::saveValueForProgram(int prog, int value) {
-  ESP_LOGI(TAG, "saveValueForProgram %d: %d", prog, value);
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x01, 0x04, 0x03, 0, 0, 0};
-  pumpPowerPacket[7] = 0x26 + prog;
-  pumpPowerPacket[8] = floor(value / 256);
-  pumpPowerPacket[9] = value % 256;
-  QueuePacket(pumpPowerPacket, 10);
-}
-
-void Intelliflo::commandRPM(int rpm) {
-  ESP_LOGI(TAG, "Command RPM: %d rpm", rpm);
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x0A, 0x04, 0x02, 0xC4, 0, 0};
-  pumpPowerPacket[8] = floor(rpm / 256);
-  pumpPowerPacket[9] = rpm % 256;
-  QueuePacket(pumpPowerPacket, 10);
-}
-
-void Intelliflo::commandFlow(int flow)  // In m3/H * 10
-{
-  ESP_LOGI(TAG, "Command Flow: %.1f m3/h", ((double) flow) / 10);
-  uint8_t pumpPowerPacket[] = {0xA5, 0x00, 0x60, 0x10, 0x09, 0x04, 0x02, 0xC4, 0x00, 0};
-  pumpPowerPacket[9] = flow;
-  QueuePacket(pumpPowerPacket, 10);
-}
-
-void Intelliflo::QueuePacket(uint8_t message[], int messageLength) {
-  ESP_LOGV(TAG, "queuePacket: Adding checksum and validating packet to be written ");
-  ESP_LOGV(TAG, "queuePacket: message length: %d", messageLength);
-
-  int checksum = 0;
-  for (int j = 0; j < messageLength; j++) {
-    checksum += message[j];
+void PentairIntelliflo::queue_command_(uint8_t command, const std::vector<uint8_t> &payload) {
+  if (this->tx_queue_.size() >= MAX_TX_QUEUE) {
+    ESP_LOGW(TAG, "TX queue full, dropping command 0x%02X", command);
+    return;
   }
 
-  std::vector<uint8_t> packet = {0xFF, 0x00, 0xFF};
-  int packetSize = 0;
-  int requestGet = 0;
+  // Everything from the 0xA5 up to the last payload byte is checksummed.
+  std::vector<uint8_t> body;
+  body.reserve(6 + payload.size());
+  body.push_back(0xA5);
+  body.push_back(0x00);  // protocol 0x00: pump messages
+  body.push_back(this->address_);
+  body.push_back(CONTROLLER_ADDRESS);
+  body.push_back(command);
+  body.push_back((uint8_t) payload.size());
+  body.insert(body.end(), payload.begin(), payload.end());
 
-  packet.insert(packet.end(), message, message + messageLength);
-  packet.push_back(checksum >> 8);
-  packet.push_back(checksum & 0xFF);
+  uint16_t sum = 0;
+  for (uint8_t b : body)
+    sum += b;
 
-  packetSize = messageLength + 3 + 2;
+  std::vector<uint8_t> frame;
+  frame.reserve(body.size() + 5);
+  frame.push_back(0xFF);  // idle padding so the pump's UART wakes up
+  frame.push_back(0x00);
+  frame.push_back(0xFF);
+  frame.insert(frame.end(), body.begin(), body.end());
+  frame.push_back((uint8_t) (sum >> 8));
+  frame.push_back((uint8_t) (sum & 0xFF));
 
-  //-------Internally validate checksum
-  int len = 0, packetchecksum = 0, databytes = 0;
-
-  // example packet: 255,0,255,165,10,16,34,2,1,0,0,228
-  len = packetSize;
-  // checksum is calculated by 256*2nd to last bit + last bit
-  packetchecksum = (packet[len - 2] * 256) + packet[len - 1];
-  databytes = 0;
-  // add up the data in the payload
-  for (int i = 3; i < len - 2; i++) {
-    databytes += packet[i];
-  }
-
-  bool validPacket = (packetchecksum == databytes);
-  if (!validPacket) {
-    ESP_LOGW(TAG, "Asking to queue malformed packet");
-  } else {
-    tx_buffer.push(packet);
-  }
+  this->tx_queue_.push_back(std::move(frame));
 }
 
-}  // namespace intelliflo
+void PentairIntelliflo::request_status() { this->queue_command_(0x07, {}); }
+
+void PentairIntelliflo::set_remote_control(bool remote) {
+  this->queue_command_(0x04, {(uint8_t) (remote ? 0xFF : 0x00)});
+}
+
+void PentairIntelliflo::set_pump_running(bool running) {
+  this->queue_command_(0x06, {running ? PUMP_STARTED : PUMP_STOPPED});
+}
+
+void PentairIntelliflo::set_speed_rpm(uint16_t rpm) {
+  rpm = std::min(rpm, MAX_RPM);
+  ESP_LOGD(TAG, "Setting speed to %u rpm", rpm);
+  this->queue_command_(0x01, {0x02, 0xC4, (uint8_t) (rpm >> 8), (uint8_t) (rpm & 0xFF)});
+}
+
+void PentairIntelliflo::set_speed_gpm(uint8_t gpm) {
+  ESP_LOGD(TAG, "Setting flow to %u gpm", gpm);
+  this->queue_command_(0x01, {0x02, 0xE4, 0x00, gpm});
+}
+
+void PentairIntelliflo::set_program_speed(uint8_t program, uint16_t rpm) {
+  if (program < 1 || program > 4) {
+    ESP_LOGW(TAG, "Program must be 1-4, got %u", program);
+    return;
+  }
+  rpm = std::min(rpm, MAX_RPM);
+  ESP_LOGD(TAG, "Storing %u rpm in external program %u", rpm, program);
+  this->queue_command_(0x01, {0x03, (uint8_t) (0x26 + program), (uint8_t) (rpm >> 8),
+                              (uint8_t) (rpm & 0xFF)});
+}
+
+void PentairIntelliflo::run_program(uint8_t program) {
+  if (program > 4) {
+    ESP_LOGW(TAG, "Program must be 0-4, got %u", program);
+    return;
+  }
+  ESP_LOGD(TAG, "Activating external program %u", program);
+  this->queue_command_(0x01, {0x03, 0x21, 0x00, (uint8_t) (program * 8)});
+}
+
+void PentairIntelliflo::set_speed_index(uint8_t index) {
+  ESP_LOGD(TAG, "Selecting built-in speed 0x%02X", index);
+  this->queue_command_(0x05, {index});
+}
+
+}  // namespace pentair_intelliflo
 }  // namespace esphome

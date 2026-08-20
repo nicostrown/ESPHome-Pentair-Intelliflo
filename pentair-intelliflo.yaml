@@ -1,150 +1,354 @@
+################################################################################
+# Pentair IntelliFlo VS  <->  Home Assistant
+# Hardware: LILYGO T-CAN485 (ESP32) on the pump's RS-485 pair (yellow / green)
+#
+# Behaviour:
+#   * "Preset" select      - Off / Low / Medium / High / Max. Picking a speed
+#                            while the pump is stopped starts it.
+#   * "Speed setpoint"     - any RPM. Changing it while running ramps the pump
+#                            to the new speed; changing it while stopped starts
+#                            the pump at that speed.
+#   * "Pump" switch        - master on/off.
+#   * Every 15 s the ESP re-asserts remote control + speed + run. The pump falls
+#     back to its own keypad/schedule if it stops hearing us, so this both keeps
+#     control and acts as a failsafe if the ESP dies.
+################################################################################
+
+substitutions:
+  name: pool-pump
+  friendly_name: Pool Pump
+  # Your pump's usable range. An IntelliFlo VS will accept 450-3450, but running
+  # below ~1000 RPM often will not prime. Raise min_rpm if yours struggles.
+  min_rpm: "1000"
+  max_rpm: "3450"
+  # Preset speeds offered by the "Preset" select.
+  low_rpm: "1200"
+  medium_rpm: "1800"
+  high_rpm: "2400"
+
 esphome:
-  name: intelliflo
-  friendly_name: Intelliflo
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  on_boot:
+    # Let the number/select/switch components restore their values, then push
+    # the restored state to the pump once.
+    - priority: -100
+      then:
+        - delay: 10s
+        - lambda: "id(startup_done) = true;"
+        - script.execute:
+            id: push_state
+            write_program_speed: true
 
 esp32:
-  board: esp32-s3-devkitc-1
+  board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
 
-# Enable logging
 logger:
+  level: DEBUG
+  logs:
+    # Bump to DEBUG to see every frame on the wire, VERBOSE for raw RX.
+    pentair_intelliflo: INFO
 
-# Enable Home Assistant API
+# Unencrypted API. To turn on encryption, add a key to your ESPHome secrets
+# (openssl rand -base64 32) and uncomment:
+#   encryption:
+#     key: !secret pool_pump_api_key
 api:
-  encryption:
-    key: "your_key"
 
 ota:
   - platform: esphome
-    password: !secret intelliflo_ota_password
+    # Optional. Add `password: !secret pool_pump_ota_password` to require one.
 
+# The only secrets this config needs are the two below.
 wifi:
-  networks:
-  - ssid: !secret wifi_ssid
-    password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "${device_name} Fallback Hotspot"
-    password: !secret intelliflo_hotspot_password
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
 
 captive_portal:
 
 external_components:
   - source:
       type: git
-      url: https://github.com/nicostrown/ESPHome-Pentair-Intelliflo
-    refresh: 0s
+      url: https://github.com/gamer22026/ESPHome-Pentair-Intelliflo
+      ref: main
+    components: [pentair_intelliflo]
+    refresh: 0s # always re-fetch; drop this to cache between builds
+
+####################### LILYGO T-CAN485 board plumbing #########################
+# Pin assignments from Xinyuan-LilyGO/T-CAN485 example/Arduino/RS485/config.h.
+# The three enable pins must be driven HIGH or the transceiver stays dead.
+# The board does its own direction switching, so there is no DE pin to toggle.
+
+switch:
+  - platform: gpio
+    id: rs485_5v_enable # PIN_5V_EN - powers the RS-485 transceiver
+    pin: GPIO16
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  - platform: gpio
+    id: rs485_enable # RS485_EN
+    pin: GPIO17
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  - platform: gpio
+    id: rs485_auto_direction # RS485_SE - enables automatic TX/RX turnaround
+    pin: GPIO19
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # ------------------------------ pump on/off -------------------------------
+  - platform: template
+    id: pump_switch
+    name: Pump
+    icon: mdi:pump
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute:
+          id: push_state
+          write_program_speed: true
+    turn_off_action:
+      - script.execute:
+          id: push_state
+          write_program_speed: false
 
 uart:
-  tx_pin: GPIO17
-  rx_pin: GPIO18
+  id: rs485
+  tx_pin: GPIO22 # RS485_TX
+  rx_pin: GPIO21 # RS485_RX
   baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+
+################################ the pump ######################################
+
+pentair_intelliflo:
+  id: pump
+  uart_id: rs485
+  address: 0x60 # first pump on the bus; 0x61.. for additional pumps
+  update_interval: 20s # background status poll
+
+globals:
+  # Suppresses the command burst that restoring saved entity values would
+  # otherwise trigger during boot.
+  - id: startup_done
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+script:
+  # Single place that reconciles the pump with what the HA entities say.
+  # write_program_speed only matters for the "External Program 1" method, where
+  # storing the speed is an EEPROM write and must not happen on every keepalive.
+  - id: push_state
+    parameters:
+      write_program_speed: bool
+    mode: single
+    then:
+      - lambda: |-
+          const float setpoint = id(pump_speed).state;
+          if (std::isnan(setpoint)) {
+            ESP_LOGW("pool_pump", "Speed setpoint not restored yet, skipping push");
+            return;
+          }
+          const uint16_t rpm = (uint16_t) lroundf(setpoint);
+          const bool want_on = id(pump_switch).state;
+          // Option index 1 of control_method is "External Program 1".
+          const bool program_mode = id(control_method).active_index().value_or(0) == 1;
+
+          // Take the pump's keypad out of the loop. Harmless to repeat.
+          id(pump).set_remote_control(true);
+
+          if (want_on) {
+            if (program_mode) {
+              if (write_program_speed)
+                id(pump).set_program_speed(1, rpm);
+              // An externally activated program times out after ~1 minute, so
+              // this has to be re-sent by the keepalive interval.
+              id(pump).run_program(1);
+            } else {
+              id(pump).set_speed_rpm(rpm);
+            }
+            id(pump).set_pump_running(true);
+          } else {
+            if (program_mode)
+              id(pump).run_program(0);
+            id(pump).set_pump_running(false);
+          }
+
+          id(pump).request_status();
+
+interval:
+  # Keepalive. Without regular traffic the pump drops out of remote control and
+  # reverts to its own keypad/schedule.
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: "return id(startup_done);"
+          then:
+            - script.execute:
+                id: push_state
+                write_program_speed: false
 
 number:
   - platform: template
-    id: pump_rpm
-    name: "Pump RPM"
-    unit_of_measurement: "RPM"
-    mode: BOX
+    id: pump_speed
+    name: Speed setpoint
+    icon: mdi:speedometer
+    unit_of_measurement: RPM
+    mode: slider
     optimistic: true
-    restore_value: True
-    min_value: 450
-    max_value: 3450
-    step: 1
-  
-  - platform: template
-    id: pump_flow
-    name: "Pump Flow"
-    device_class: volume_flow_rate
-    unit_of_measurement: "m³/h"
-    mode: BOX
-    optimistic: true
-    restore_value: True
-    min_value: 4.0
-    max_value: 20.0
-    step: 0.1
-
-interval:
-  - interval: 10s
-    then:
-      - if: 
-          condition: 
-            - lambda: 'return id(pump_select).state == "RPM";'
-          then:
-            - lambda: !lambda |- 
-                id(pentair).pumpToRemoteControl();
-                id(pentair).commandRPM(id(pump_rpm).state);
-                id(pentair).requestPumpStatus();
-      - if: 
-          condition: 
-            - lambda: 'return id(pump_select).state == "Flow";'
-          then:
-            - lambda: !lambda |- 
-                id(pentair).pumpToRemoteControl();
-                id(pentair).commandFlow(id(pump_flow).state * 10);
-                id(pentair).requestPumpStatus();
-
-sensor:
-  - platform: pentair_intelliflo
-    power:
-      name: "Power"
-    rpm:
-      name: "RPM"
-    flow:
-      name: "Flow"
-    pressure:
-      name: "Pressure"
-      unit_of_measurement: "bar"
-
-binary_sensor:
-  - platform: pentair_intelliflo
-    running:
-      name: "Running"
-
-text_sensor:
-  - platform: pentair_intelliflo
-    program:
-      name: "Program"
-
-button:
-  - platform: template
-      name: "Pentair test"
-      entity_category: CONFIG
-      on_press: 
-        then: 
-          - lambda: !lambda |- 
-              id(pentair).pumpToRemoteControl();
-              id(pentair).commandRPM(1000);
+    restore_value: true
+    initial_value: ${low_rpm} # used only on a first-ever boot
+    min_value: ${min_rpm}
+    max_value: ${max_rpm}
+    step: 10
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return id(startup_done);"
+            then:
+              # Setting a speed on a stopped pump starts it. publish_state()
+              # instead of turn_on() so push_state does not fire twice.
+              - lambda: |-
+                  if (!id(pump_switch).state)
+                    id(pump_switch).publish_state(true);
+              - script.execute:
+                  id: push_state
+                  write_program_speed: true
 
 select:
   - platform: template
-    id: pump_select
-    name: "Pump mode"
-    optimistic: True
-    options: 
-      - Local
-      - RPM
-      - Flow
+    id: pump_preset
+    name: Preset
+    icon: mdi:pump
+    optimistic: true
+    options:
+      - "Off"
+      - "Low (${low_rpm} RPM)"
+      - "Medium (${medium_rpm} RPM)"
+      - "High (${high_rpm} RPM)"
+      - "Max (${max_rpm} RPM)"
+    initial_option: "Off"
     on_value:
       then:
-        - if: 
-            condition: 
-              - lambda: 'return x == "RPM";'
-            then:
-              - lambda: !lambda |- 
-                  id(pentair).pumpToRemoteControl();
-                  id(pentair).commandRPM(id(pump_rpm).state);
-                  id(pentair).requestPumpStatus();
-        - if: 
-            condition: 
-              - lambda: 'return x == "Flow";'
-            then:
-              - lambda: !lambda |- 
-                  id(pentair).pumpToRemoteControl();
-                  id(pentair).commandFlow(id(pump_flow).state * 10);
-                  id(pentair).requestPumpStatus();
+        # `i` is the index of the selected option, in the order listed above.
+        - lambda: |-
+            if (!id(startup_done))
+              return;
+            static const int PRESET_RPM[] = {0, ${low_rpm}, ${medium_rpm}, ${high_rpm}, ${max_rpm}};
+            const int rpm = (i < sizeof(PRESET_RPM) / sizeof(PRESET_RPM[0])) ? PRESET_RPM[i] : 0;
+            if (rpm == 0) {
+              id(pump_switch).turn_off();
+            } else {
+              // Writing the number fires its on_value, which starts the pump.
+              auto call = id(pump_speed).make_call();
+              call.set_value(rpm);
+              call.perform();
+            }
 
-pentair_intelliflo:
-  id: pentair
+  # Two ways to command a speed exist on the bus. "Direct RPM" (register 0x02C4)
+  # is volatile and is what nodejs-poolController uses. If your pump ignores it,
+  # switch to "External Program 1", which stores the speed in the pump's program
+  # 1 (register 0x0327) and then activates that program (register 0x0321).
+  - platform: template
+    id: control_method
+    name: Control method
+    icon: mdi:tune
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "Direct RPM"
+      - "External Program 1"
+    initial_option: "Direct RPM"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return id(startup_done);"
+            then:
+              - script.execute:
+                  id: push_state
+                  write_program_speed: true
+
+############################### status readback ################################
+
+sensor:
+  - platform: pentair_intelliflo
+    pentair_intelliflo_id: pump
+    power:
+      name: Power
+    rpm:
+      name: Speed
+    flow:
+      name: Flow
+    filter_percent:
+      name: Filter cycle used
+    error_code:
+      name: Error code
+    time_remaining:
+      name: Time remaining
+
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: pentair_intelliflo
+    pentair_intelliflo_id: pump
+    running:
+      name: Running
+    remote_control:
+      name: Remote control
+
+  - platform: status
+    name: Status
+
+text_sensor:
+  - platform: pentair_intelliflo
+    pentair_intelliflo_id: pump
+    program:
+      name: Program
+    pump_state:
+      name: Drive state
+    error:
+      name: Error
+
+################################ diagnostics ###################################
+
+button:
+  - platform: template
+    name: Request status
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      - lambda: "id(pump).request_status();"
+
+  # Stops the pump and hands control back to its own keypad and schedule.
+  - platform: template
+    name: Release to local control
+    icon: mdi:lock-open-variant
+    entity_category: config
+    on_press:
+      - switch.turn_off: pump_switch
+      - delay: 1s
+      - lambda: "id(pump).set_remote_control(false);"
+
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
