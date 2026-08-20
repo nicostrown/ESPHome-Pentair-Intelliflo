@@ -2,101 +2,115 @@
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/sensor/sensor.h"
-//#include "esphome/components/select/select.h"
-// #include "esphome/components/switch/switch.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/uart/uart.h"
-// #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#include <queue>
+
+#include <deque>
+#include <string>
+#include <vector>
 
 namespace esphome {
-namespace intelliflo {
+namespace pentair_intelliflo {
 
-enum running : uint8_t {
-  STOPPED = 0x04,
-  RUNNING = 0x0A,
-};
+// Byte [0] of the 0x07 status payload.
+static const uint8_t PUMP_STOPPED = 0x04;
+static const uint8_t PUMP_STARTED = 0x0A;
 
-enum program : uint8_t {
-  NO_PROG = 0x00,
-  LOCAL1 = 0x01,
-  LOCAL2 = 0x02,
-  LOCAL3 = 0x03,
-  LOCAL4 = 0x04,
-  EXT1 = 0x09,
-  EXT2 = 0x0A,
-  EXT3 = 0x0B,
-  EXT4 = 0x0C,
-  TIMEOUT = 0x0E,
-  PRIMING = 0x11,
-  QUICKCLEAN = 0x0D,
-  UNKNOWN = 0xFF,
-};
-
-class Intelliflo : public uart::UARTDevice, public PollingComponent {
-  void switch_command(const std::string &command);
+class PentairIntelliflo : public PollingComponent, public uart::UARTDevice {
+ public:
   void setup() override;
   void loop() override;
-  void dump_config() override;
   void update() override;
+  void dump_config() override;
+
+  void set_address(uint8_t address) { this->address_ = address; }
+
+  void set_power_sensor(sensor::Sensor *s) { this->power_ = s; }
+  void set_rpm_sensor(sensor::Sensor *s) { this->rpm_ = s; }
+  void set_flow_sensor(sensor::Sensor *s) { this->flow_ = s; }
+  void set_filter_percent_sensor(sensor::Sensor *s) { this->filter_percent_ = s; }
+  void set_error_code_sensor(sensor::Sensor *s) { this->error_code_ = s; }
+  void set_time_remaining_sensor(sensor::Sensor *s) { this->time_remaining_ = s; }
+
+  void set_running_binary_sensor(binary_sensor::BinarySensor *s) { this->running_ = s; }
+  void set_remote_control_binary_sensor(binary_sensor::BinarySensor *s) { this->remote_control_ = s; }
+
+  void set_program_text_sensor(text_sensor::TextSensor *s) { this->program_ = s; }
+  void set_pump_state_text_sensor(text_sensor::TextSensor *s) { this->pump_state_ = s; }
+  void set_error_text_sensor(text_sensor::TextSensor *s) { this->error_ = s; }
+
+  // --- Commands. All of these queue a frame; they never block. ---
+
+  /// Ask the pump for a 0x07 status frame.
+  void request_status();
+  /// true locks the pump's own keypad and hands control to us (0x04 / 0xFF).
+  void set_remote_control(bool remote);
+  /// Start (0x0A) or stop (0x04) the drive (0x06).
+  void set_pump_running(bool running);
+  /// Volatile "run at this speed" (0x01 / 0x02C4). Does not touch pump EEPROM.
+  void set_speed_rpm(uint16_t rpm);
+  /// Volatile "run at this flow" in GPM (0x01 / 0x02E4). VF/VSF pumps only.
+  void set_speed_gpm(uint8_t gpm);
+  /// Store a speed in External Program 1-4 (0x01 / 0x0327-0x032A). Writes EEPROM.
+  void set_program_speed(uint8_t program, uint16_t rpm);
+  /// Activate External Program 1-4, or 0 to deactivate (0x01 / 0x0321).
+  /// The pump drops an externally activated program after ~1 minute, so this
+  /// has to be repeated while the program should stay active.
+  void run_program(uint8_t program);
+  /// Select one of the pump's built-in speeds (0x05).
+  void set_speed_index(uint8_t index);
+
+  // --- Aliases matching the upstream component's method names. ---
+  void requestPumpStatus() { this->request_status(); }                       // NOLINT
+  void pumpToRemoteControl() { this->set_remote_control(true); }             // NOLINT
+  void pumpToLocalControl() { this->set_remote_control(false); }             // NOLINT
+  void run() { this->set_pump_running(true); }
+  void stop() { this->set_pump_running(false); }
+  void commandRPM(int rpm) { this->set_speed_rpm(rpm < 0 ? 0 : (uint16_t) rpm); }   // NOLINT
+  void commandFlow(int gpm) { this->set_speed_gpm(gpm < 0 ? 0 : (uint8_t) gpm); }   // NOLINT
+  void commandExternalProgram(int prog) { this->run_program((uint8_t) prog); }      // NOLINT
+  void saveValueForProgram(int prog, int value) {                                   // NOLINT
+    this->set_program_speed((uint8_t) prog, value < 0 ? 0 : (uint16_t) value);
+  }
+
+  // --- Last known state, for use from lambdas. ---
+  bool is_running() const { return this->running_state_; }
+  bool is_remote_control() const { return this->remote_state_; }
+  uint16_t current_rpm() const { return this->rpm_state_; }
+  uint16_t current_watts() const { return this->watts_state_; }
 
  protected:
-  uint32_t last_received_byte_millis = 0;
+  void queue_command_(uint8_t command, const std::vector<uint8_t> &payload);
+  void feed_byte_(uint8_t byte);
+  bool resync_();
+  void handle_frame_(size_t total);
+  void publish_status_(const uint8_t *payload);
 
-  void send_array_cmd(std::vector<uint8_t> data);
-  void send_array_cmd(const uint8_t *data, size_t len);
+  uint8_t address_{0x60};
 
-  void parse_packet(const std::vector<uint8_t> &data);  // parsing the status package
+  std::vector<uint8_t> rx_;
+  std::deque<std::vector<uint8_t>> tx_queue_;
+  uint32_t last_rx_ms_{0};
+  uint32_t last_tx_ms_{0};
 
-  void handle_received_byte(uint8_t c);  // received byte handler
-  bool validate_received_message();      // function of checking the received message
+  bool running_state_{false};
+  bool remote_state_{false};
+  uint16_t rpm_state_{0};
+  uint16_t watts_state_{0};
 
-  void query_status();
-
-  void publish_state_if_changed();
-
-  std::vector<uint8_t> rx_buffer;
-  std::queue<std::vector<uint8_t>> tx_buffer;
-  bool ready_to_tx = true;
-
-  void QueuePacket(uint8_t message[], int messageLength);
-
-  sensor::Sensor *power_;
-  sensor::Sensor *rpm_;
-  sensor::Sensor *flow_;
-  sensor::Sensor *pressure_;
-
-  binary_sensor::BinarySensor *running_;
-
-  text_sensor::TextSensor *program_;
-
-  //select::Select *pumpmode_selector_{nullptr};
-
- public:
-  void set_power(sensor::Sensor *sensor) { power_ = sensor; }
-  void set_rpm(sensor::Sensor *sensor) { rpm_ = sensor; }
-  void set_flow(sensor::Sensor *sensor) { flow_ = sensor; }
-  void set_pressure(sensor::Sensor *sensor) { pressure_ = sensor; }
-
-  void set_running(binary_sensor::BinarySensor *sensor) { running_ = sensor; }
-
-  void set_program(text_sensor::TextSensor *sensor) { program_ = sensor; }
-
-  //void void set_operating_mode_select(select::Select *selector) { pumpmode_selector_ = selector; };
-
-  void requestPumpStatus();
-  void run();
-  void stop();
-  void commandLocalProgram(int prog);
-  void commandExternalProgram(int prog);
-  void saveValueForProgram(int prog, int value);
-  void commandRPM(int rpm);
-  void commandFlow(int flow);  // In m3/H * 10
-  void pumpToLocalControl();
-  void pumpToRemoteControl();
-
+  sensor::Sensor *power_{nullptr};
+  sensor::Sensor *rpm_{nullptr};
+  sensor::Sensor *flow_{nullptr};
+  sensor::Sensor *filter_percent_{nullptr};
+  sensor::Sensor *error_code_{nullptr};
+  sensor::Sensor *time_remaining_{nullptr};
+  binary_sensor::BinarySensor *running_{nullptr};
+  binary_sensor::BinarySensor *remote_control_{nullptr};
+  text_sensor::TextSensor *program_{nullptr};
+  text_sensor::TextSensor *pump_state_{nullptr};
+  text_sensor::TextSensor *error_{nullptr};
 };
 
-}  // namespace intelliflo
+}  // namespace pentair_intelliflo
 }  // namespace esphome
